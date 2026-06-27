@@ -14,47 +14,30 @@ function loadCaught() {
 }
 
 const caught = loadCaught();
-const discoveredSecrets = JSON.parse(localStorage.getItem('discoveredSecrets') || '[]');
 const shownMilestones = new Set(JSON.parse(localStorage.getItem('shownMilestones') || '[]'));
 let allTagKeys = [];
 let codeEl = null;
-let secretsEl = null;
 let panelEl = null;
 let codeSectionEl = null;
 let dotEl = null;
-let hasUnviewed = false;
 let panelOpen = false;
-const secrets = {};
-
-async function loadSecrets() {
-    const res = await fetch('src/secrets.html');
-    const text = await res.text();
-    let currentTag = null;
-    text.trim().split('\n').forEach(line => {
-        line = line.trim();
-        if (!line) return;
-        if (line.match(/^<\/?[\w]+>$/)) {
-            currentTag = line;
-            if (!secrets[currentTag]) secrets[currentTag] = [];
-        } else if (currentTag) {
-            const isUrl = line.startsWith('http');
-            const isArena = line.includes('are.na/block/');
-            const type = isArena ? 'image' : isUrl ? 'link' : 'text';
-            secrets[currentTag].push({ type, value: line });
-        }
-    });
-    renderSecrets();
-}
 
 const GOLD_CHANCE = 0.05;
+const bossTags = new Set(); // tags flagged with a trailing ":boss" in tags.html
 
 export function getWeightedFish(creaturesData) {
+    bossTags.clear();
     const lines = creaturesData.trim().split('\n');
     const weightedPool = [];
     lines.forEach(line => {
-        const [str, weight] = line.split(':');
-        const s = str.trim();
+        const [str, weight, flag] = line.split(':');
+        const s = (str || '').trim();
         const w = parseInt(weight);
+        if (!s || isNaN(w)) return;
+        if (flag && flag.trim() === 'boss') {
+            const tag = getTag(s);
+            if (tag) bossTags.add(tag);
+        }
         const h = new Date().getHours();
         const isLateNight = h >= 23 || h <= 3;
         const effectiveW = isLateNight && w <= 12 ? Math.round(w * 5) : w;
@@ -69,32 +52,15 @@ function saveCaught() {
     localStorage.setItem('caught', JSON.stringify(caught));
 }
 
-function completeKeys(keys) {
-    for (const key of keys) {
-        const tag = key.replace('¤', '');
-        if (!caught[key]) caught[key] = { open: 0, close: 0 };
-        if (caught[key].open === 0) caught[key].open = 1;
-        if (!VOID_TAGS.has(tag) && caught[key].close === 0) caught[key].close = 1;
-    }
-    saveCaught();
-    checkMilestones();
-    renderInventory();
-}
-
-
 window.clearInventory = () => {
     Object.keys(caught).forEach(k => delete caught[k]);
-    discoveredSecrets.length = 0;
     shownMilestones.clear();
     saveCaught();
-    localStorage.removeItem('discoveredSecrets');
     localStorage.removeItem('shownMilestones');
     renderInventory();
-    renderSecrets();
 };
 
 function setUnviewed(val) {
-    hasUnviewed = val;
     if (dotEl) dotEl.style.display = (val && !panelOpen) ? 'block' : 'none';
 }
 
@@ -140,13 +106,6 @@ function saveMilestone(name) {
     setUnviewed(true);
 }
 
-function checkSecretsMilestone() {
-    if (!Object.keys(secrets).length) return;
-    const discoveredTags = new Set(discoveredSecrets.map(s => s.tag));
-    const allFound = [...Object.keys(secrets)].every(t => discoveredTags.has(t));
-    if (allFound && !shownMilestones.has('secrets')) { saveMilestone('secrets'); renderSecrets(); }
-}
-
 function checkMilestones() {
     if (!allTagKeys.length) return;
     const whiteKeys = allTagKeys.filter(k => !k.startsWith('¤'));
@@ -162,48 +121,127 @@ function totalCaught() {
     return Object.values(caught).reduce((s, c) => s + c.open + c.close, 0);
 }
 
-function showNetUnlock() {
-    if (shownMilestones.has('net')) return;
-    saveMilestone('net');
+// Net upgrade tiers. Side length traces an S-curve (slow, then fast, then slow)
+// from 150 px at unlock to unlimited at 1500 caught. Each tier shows a one-time
+// unlock message via checkNetUpgrades().
+const NET_TIERS = [
+    { key: 'net',  at: 50,   size: 150,      name: 'NET',           desc: 'click + drag to catch multiple fish' },
+    { key: 'net2', at: 300,  size: 380,      name: 'CAST NET',      desc: 'a wider throw' },
+    { key: 'net3', at: 600,  size: 650,      name: 'TRAWL NET',     desc: 'sweep the shallows' },
+    { key: 'net4', at: 950,  size: 1000,     name: 'SEINE NET',     desc: 'haul in whole schools' },
+    { key: 'net5', at: 1250, size: 1300,     name: 'DRAGNET',       desc: 'almost nothing escapes' },
+    { key: 'net6', at: 1500, size: Infinity, name: 'BOUNDLESS NET', desc: 'the whole pond is yours' },
+];
+const NET_UNLOCK = NET_TIERS[0].at; // fish caught to unlock the net
+// Net recharge scales with the size of the net you cast along an exponential
+// curve from NET_COOLDOWN_MIN (tiny casts) up to NET_COOLDOWN_MAX (a cast at
+// NET_COOLDOWN_REF_SIZE px or larger). Exponential keeps small/medium nets
+// cheap and only makes the biggest casts expensive.
+const NET_COOLDOWN_MIN = 50;        // ms recharge for tiny casts
+const NET_COOLDOWN_MAX = 5000;      // ms recharge for the largest casts
+const NET_COOLDOWN_REF_SIZE = 1300; // cast size (px) that reaches the max recharge
+
+// Current max net (drag-box) side length in px for how many fish you've caught.
+function netMaxSize() {
+    const c = totalCaught();
+    let size = 0;
+    for (const t of NET_TIERS) if (c >= t.at) size = t.size;
+    return size;
+}
+
+// Clamped square net rectangle from a drag start to a current point.
+function netRect(start, ex, ey) {
+    const max = netMaxSize();
+    const dx = ex - start.x, dy = ey - start.y;
+    const w = Math.min(Math.abs(dx), max);
+    const h = Math.min(Math.abs(dy), max);
+    return {
+        left: dx >= 0 ? start.x : start.x - w,
+        top: dy >= 0 ? start.y : start.y - h,
+        width: w,
+        height: h,
+    };
+}
+
+// Recharge time (ms) for a cast: its size (geometric mean of width and height)
+// mapped exponentially onto [NET_COOLDOWN_MIN, NET_COOLDOWN_MAX].
+function netCooldownFor(w, h) {
+    const size = Math.sqrt(Math.max(0, w) * Math.max(0, h));
+    const t = Math.min(1, size / NET_COOLDOWN_REF_SIZE);
+    return NET_COOLDOWN_MIN * Math.pow(NET_COOLDOWN_MAX / NET_COOLDOWN_MIN, t);
+}
+
+function showNetMessage(tier) {
     const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:100;cursor:pointer;';
+    overlay.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:100;';
     const box = document.createElement('div');
     box.style.cssText = 'background:rgba(0,10,2,0.92);color:white;font-family:monospace;font-size:20px;line-height:2;padding:48px 56px;border:1px solid #1a2a1a;text-align:center;backdrop-filter:blur(8px);';
-    box.innerHTML = `you've unlocked:<br><br><span style="font-size:32px">NET!</span><br><br><span style="color:#555;font-size:15px">click + drag to catch multiple fish</span>`;
+    const heading = tier.key === 'net' ? "you've unlocked:" : 'net upgraded:';
+    const sizeLabel = tier.size === Infinity ? 'unlimited reach' : `${tier.size}×${tier.size} px`;
+    box.innerHTML = `${heading}<br><br><span style="font-size:32px">${tier.name}!</span><br><br><span style="color:#555;font-size:15px">${tier.desc}<br>${sizeLabel}</span>`;
+    const btn = document.createElement('button');
+    btn.textContent = 'ok!';
+    btn.style.cssText = 'margin-top:32px;background:transparent;color:#5a9a5a;font-family:monospace;font-size:18px;letter-spacing:1px;padding:10px 28px;border:1px solid #1a2a1a;cursor:pointer;';
+    btn.addEventListener('mouseenter', () => { btn.style.color = '#8fc98f'; btn.style.borderColor = '#2a4a2a'; });
+    btn.addEventListener('mouseleave', () => { btn.style.color = '#5a9a5a'; btn.style.borderColor = '#1a2a1a'; });
+    btn.addEventListener('click', () => overlay.remove());
+    box.appendChild(btn);
     overlay.appendChild(box);
     document.body.appendChild(overlay);
-    overlay.addEventListener('click', () => overlay.remove());
+    btn.focus();
+}
+
+// Show a one-time message for the highest net tier newly reached.
+function checkNetUpgrades() {
+    const c = totalCaught();
+    let highestNew = -1;
+    for (let i = 0; i < NET_TIERS.length; i++) {
+        if (c < NET_TIERS[i].at) break;
+        if (!shownMilestones.has(NET_TIERS[i].key)) {
+            highestNew = i;
+            saveMilestone(NET_TIERS[i].key);
+        }
+    }
+    if (highestNew >= 0) showNetMessage(NET_TIERS[highestNew]);
 }
 
 function catchFish(fishStr, el) {
     el.remove();
     const key = tagKey(fishStr);
+    const firstEver = !caught[key];
     if (!caught[key]) caught[key] = { open: 0, close: 0 };
+    const wasComplete = isComplete(key);
     const isFirst = isClosing(fishStr) ? caught[key].close === 0 : caught[key].open === 0;
     if (isClosing(fishStr)) caught[key].close++;
     else caught[key].open++;
     saveCaught();
 
-    let secretFound = false;
-    const tagStr = `<${key.replace('¤', '')}>`;
-    const pool = secrets[tagStr];
-    if (pool && pool.length > 0 && Math.random() < 0.05) {
-        const foundValues = new Set(discoveredSecrets.map(s => s.value));
-        const remaining = pool.filter(s => !foundValues.has(s.value));
-        if (remaining.length > 0) {
-            const picked = remaining[Math.floor(Math.random() * remaining.length)];
-            discoveredSecrets.push({ tag: tagStr, type: picked.type, value: picked.value });
-            localStorage.setItem('discoveredSecrets', JSON.stringify(discoveredSecrets));
-            secretFound = true;
-        }
-    }
-
+    notifyCatch(fishStr, key, firstEver, wasComplete, isComplete(key));
     checkMilestones();
-    checkSecretsMilestone();
-    if (totalCaught() >= 50) showNetUnlock();
-    if (isFirst || secretFound) setUnviewed(true);
+    checkNetUpgrades();
+    if (isFirst) setUnviewed(true);
     renderInventory();
-    renderSecrets();
+}
+
+// A single hit: bosses lose 1 HP per hit and are only caught at 0; normal fish
+// are caught on the first hit. Used by both click and net.
+function hitFish(fishStr, el, viaNet = false) {
+    if (el.dataset.boss !== '1') {
+        catchFish(fishStr, el);
+        return;
+    }
+    const max = parseFloat(el.dataset.maxhp);
+    const dmg = viaNet ? parseFloat(el.dataset.netdmg) : 1; // net effect diminishes per boss
+    const hp = parseFloat(el.dataset.hp) - dmg;
+    el.dataset.hp = String(hp);
+    if (hp <= 0) {
+        catchFish(fishStr, el);
+        return;
+    }
+    const fill = el.querySelector('[data-hpfill]');
+    if (fill) fill.style.width = Math.max(0, (hp / max) * 100) + '%';
+    el.style.opacity = '0.55';
+    setTimeout(() => { if (el.isConnected) el.style.opacity = '1'; }, 90);
 }
 
 function applyTagStyle(el, fishStr) {
@@ -242,7 +280,15 @@ function makeLine(lineNum, indent, content, color, extra, bold, italic) {
 function renderInventory() {
     codeEl.innerHTML = '';
 
-    const entries = Object.entries(caught).sort((a, b) => {
+    // once a tag's golden form is captured, the gold entry stands in for the
+    // white one — drop the white row to save space in caught.html
+    const goldTags = new Set(
+        Object.keys(caught).filter(k => k.startsWith('¤')).map(k => k.slice(1))
+    );
+
+    const entries = Object.entries(caught).filter(([key]) =>
+        key.startsWith('¤') || !goldTags.has(key)
+    ).sort((a, b) => {
         const ag = a[0].startsWith('¤'), bg = b[0].startsWith('¤');
         if (ag !== bg) return ag ? -1 : 1;
         const aComplete = a[1].open > 0 && (VOID_TAGS.has(a[0].replace('¤','')) || a[1].close > 0);
@@ -332,93 +378,6 @@ function makeCollapsibleSection(label, contentEl, storageKey, onToggle) {
     return wrap;
 }
 
-function renderSecrets() {
-    if (!secretsEl) return;
-    secretsEl.innerHTML = '';
-
-    if (shownMilestones.has('secrets')) {
-        const badge = document.createElement('div');
-        badge.textContent = '<!-- all secrets discovered -->';
-        badge.style.cssText = 'color:#5a9a5a;padding:4px 16px 12px;';
-        secretsEl.appendChild(badge);
-    }
-
-    if (discoveredSecrets.length === 0) {
-        const empty = document.createElement('div');
-        empty.textContent = '<!-- no secrets discovered -->';
-        empty.style.cssText = 'color:#444;padding:4px 16px 24px;';
-        secretsEl.appendChild(empty);
-        return;
-    }
-
-    const seen = new Set();
-    const deduped = discoveredSecrets.filter(s => seen.has(s.value) ? false : seen.add(s.value));
-
-    const byTag = new Map();
-    for (const secret of deduped) {
-        if (!byTag.has(secret.tag)) byTag.set(secret.tag, []);
-        byTag.get(secret.tag).push(secret);
-    }
-
-    const allImages = deduped.filter(s => s.type === 'image');
-    if (allImages.length > 0) {
-        const grid = document.createElement('div');
-        grid.style.cssText = 'display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:12px 16px 20px;';
-        for (const secret of allImages) {
-            const a = document.createElement('a');
-            a.href = secret.value;
-            a.target = '_blank';
-            a.rel = 'noopener noreferrer';
-            a.style.cssText = 'display:block;aspect-ratio:1;overflow:hidden;opacity:0.85;';
-            const img = document.createElement('img');
-            img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
-            const arenaMatch = secret.value.match(/are\.na\/block\/(\d+)/);
-            if (arenaMatch) {
-                fetch(`https://api.are.na/v3/blocks/${arenaMatch[1]}`)
-                    .then(r => r.json())
-                    .then(block => { img.src = block.image?.square?.src || block.image?.medium?.src || block.image?.original?.src || ''; });
-            } else {
-                img.src = secret.value;
-            }
-            a.appendChild(img);
-            grid.appendChild(a);
-        }
-        secretsEl.appendChild(grid);
-    }
-
-    for (const [tag, items] of byTag) {
-        const nonImages = items.filter(s => s.type !== 'image');
-        if (nonImages.length === 0) continue;
-
-        const group = document.createElement('div');
-        group.style.cssText = 'padding:4px 16px 16px;';
-
-        const lbl = document.createElement('div');
-        lbl.textContent = tag;
-        lbl.style.cssText = 'color:#555;margin-bottom:8px;';
-        group.appendChild(lbl);
-
-        for (const secret of nonImages) {
-            if (secret.type === 'text') {
-                const p = document.createElement('div');
-                p.textContent = secret.value;
-                p.style.cssText = 'color:white;line-height:1.6;';
-                group.appendChild(p);
-            } else if (secret.type === 'link') {
-                const a = document.createElement('a');
-                a.href = secret.value;
-                a.textContent = secret.value;
-                a.target = '_blank';
-                a.rel = 'noopener noreferrer';
-                a.style.cssText = 'display:block;color:#5a9a5a;word-break:break-all;margin-bottom:4px;';
-                group.appendChild(a);
-            }
-        }
-
-        secretsEl.appendChild(group);
-    }
-}
-
 function createInventory() {
     const handle = document.createElement('div');
     handle.textContent = '▶';
@@ -457,6 +416,8 @@ function createInventory() {
         'transition:right 0.3s ease',
         'display:flex',
         'flex-direction:column',
+        'user-select:none',
+        '-webkit-user-select:none',
     ].join(';');
 
     const titleBar = document.createElement('div');
@@ -467,11 +428,7 @@ function createInventory() {
     codeEl.style.cssText = 'padding:12px 12px 32px;';
 
     codeSectionEl = makeCollapsibleSection('caught.html', codeEl, 'codeCollapsed');
-    codeSectionEl.style.cssText += ';flex-shrink:0;max-height:45vh;overflow-y:auto;';
-
-    secretsEl = document.createElement('div');
-    const secretsSection = makeCollapsibleSection('secrets.html', secretsEl, 'secretsCollapsed');
-    secretsSection.style.cssText += ';flex:1;overflow-y:auto;min-height:0;';
+    codeSectionEl.style.cssText += ';flex:1;overflow-y:auto;min-height:0;';
 
     const infoContentEl = document.createElement('div');
     infoContentEl.style.cssText = 'padding:0 0 16px;';
@@ -489,7 +446,6 @@ function createInventory() {
 
     panelEl.appendChild(titleBar);
     panelEl.appendChild(codeSectionEl);
-    panelEl.appendChild(secretsSection);
     panelEl.appendChild(infoSection);
     dotEl = document.createElement('span');
     dotEl.style.cssText = [
@@ -546,20 +502,184 @@ function makeFishEl(fishStr, container) {
         'font-size:26px',
         'white-space:pre',
         'cursor:pointer',
+        'user-select:none',
+        '-webkit-user-select:none',
         `width:${(display.length + TAIL.length) * CHAR_W}px`,
         `height:${CHAR_H}px`,
     ].join(';');
     applyTagStyle(el, fishStr);
-    el.addEventListener('click', () => catchFish(fishStr, el));
+    el.addEventListener('click', () => hitFish(fishStr, el));
     container.appendChild(el);
     return el;
+}
+
+// A boss is a large red fish with a health bar. `fontSize` sets its size;
+// `netDmg` is how much one net hit removes (clicks always remove 1).
+function makeBossEl(fishStr, container, hp, fontSize, netDmg) {
+    const display = displayStr(fishStr);
+    const scale = fontSize / 26; // 26px is the normal fish size
+    const el = document.createElement('div');
+    el.dataset.fish = fishStr;
+    el.dataset.boss = '1';
+    el.dataset.hp = String(hp);
+    el.dataset.maxhp = String(hp);
+    el.dataset.netdmg = String(netDmg);
+    el.style.cssText = [
+        'position:absolute',
+        'top:0',
+        'left:0',
+        'color:#ff3b3b',
+        'font-family:monospace',
+        `font-size:${fontSize}px`,
+        'font-weight:bold',
+        'white-space:pre',
+        'cursor:pointer',
+        'user-select:none',
+        '-webkit-user-select:none',
+        'text-shadow:0 0 14px rgba(255,40,40,0.55)',
+        `width:${(display.length + TAIL.length) * CHAR_W * scale}px`,
+        `height:${CHAR_H * scale}px`,
+    ].join(';');
+
+    const label = document.createElement('span');
+    label.textContent = TAIL + display;
+    el.appendChild(label);
+
+    const barH = Math.round(5 + scale * 2);
+    const bar = document.createElement('div');
+    bar.style.cssText = `position:absolute;left:0;top:${-(barH + 8)}px;width:100%;height:${barH}px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,60,60,0.6);`;
+    const fill = document.createElement('div');
+    fill.dataset.hpfill = '1';
+    fill.style.cssText = 'height:100%;width:100%;background:#ff3b3b;transition:width 0.12s ease;';
+    bar.appendChild(fill);
+    el.appendChild(bar);
+
+    el.addEventListener('click', () => hitFish(fishStr, el));
+    container.appendChild(el);
+    return el;
+}
+
+function showBossBanner() {
+    const banner = document.createElement('div');
+    banner.textContent = '⚠ boss! ⚠';
+    banner.style.cssText = 'position:fixed;top:8%;left:50%;transform:translateX(-50%);color:#ff3b3b;font-family:monospace;font-size:28px;letter-spacing:4px;text-shadow:0 0 16px rgba(255,40,40,0.7);z-index:90;pointer-events:none;transition:opacity 1s ease;';
+    document.body.appendChild(banner);
+    setTimeout(() => { banner.style.opacity = '0'; }, 1800);
+    setTimeout(() => banner.remove(), 2900);
+}
+
+let noticeContainer = null;
+// Small toast in the bottom-left; stacks and auto-dismisses.
+function showNotice(html, color) {
+    if (!noticeContainer) {
+        noticeContainer = document.createElement('div');
+        noticeContainer.style.cssText = 'position:fixed;left:24px;bottom:24px;z-index:80;display:flex;flex-direction:column;gap:8px;pointer-events:none;';
+        document.body.appendChild(noticeContainer);
+    }
+    while (noticeContainer.children.length >= 6) noticeContainer.firstChild.remove();
+
+    const note = document.createElement('div');
+    note.innerHTML = html;
+    note.style.cssText = `background:rgba(0,10,2,0.9);color:${color};font-family:monospace;font-size:15px;padding:10px 16px;border:1px solid #1a2a1a;border-left:3px solid ${color};backdrop-filter:blur(6px);white-space:pre;opacity:0;transform:translateY(8px);transition:opacity 0.25s ease,transform 0.25s ease;`;
+    noticeContainer.appendChild(note);
+    requestAnimationFrame(() => { note.style.opacity = '1'; note.style.transform = 'translateY(0)'; });
+    setTimeout(() => { note.style.opacity = '0'; note.style.transform = 'translateY(8px)'; }, 3200);
+    setTimeout(() => note.remove(), 3600);
+}
+
+// Announce a first-ever catch of a tag/colour, or a freshly completed pair.
+function notifyCatch(fishStr, key, firstEver, wasComplete, nowComplete) {
+    const golden = key.startsWith('¤');
+    const tag = key.replace('¤', '');
+    const color = golden ? '#ffd700' : '#9ad29a';
+    const mark = golden ? '✦ ' : '';
+    const esc = s => s.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    if (nowComplete && !wasComplete) {
+        const pair = VOID_TAGS.has(tag) ? `<${tag}>` : `<${tag}></${tag}>`;
+        showNotice(`${mark}${esc(pair)} complete!`, color);
+    } else if (firstEver) {
+        showNotice(`${mark}new fish: ${esc(displayStr(fishStr))}`, color);
+    }
+}
+
+const BOSS_HUNT_SPEED = 175;  // px/s while actively chasing prey
+const BOSS_DRIFT_SPEED = 70;  // px/s while full and just cruising
+const BOSS_HUNT_RADIUS = 750; // px within which a hungry boss spots prey
+const BOSS_HEAL_PER_FISH = 1; // hp regained per fish swallowed
+
+// A boss runs its own movement loop: while hurt it chases the nearest fish and
+// eats any within reach (healing per fish, up to full); while full it just
+// drifts and wraps. Self-stops once the boss is caught (removed from the DOM).
+function runBoss(boss, container, startX) {
+    let x = startX;
+    let y = window.innerHeight * (0.15 + Math.random() * 0.65);
+    const bobOff = Math.random() * Math.PI * 2;
+    let last = null;
+    boss.style.transform = `translate(${x}px,${y}px)`;
+
+    function frame(ts) {
+        if (!boss.isConnected) return;
+        if (last === null) last = ts;
+        const dt = Math.min(0.05, (ts - last) / 1000);
+        last = ts;
+
+        const bw = boss.offsetWidth, bh = boss.offsetHeight;
+        const cx = x + bw / 2, cy = y + bh / 2;
+        const max = parseFloat(boss.dataset.maxhp);
+        let hp = parseFloat(boss.dataset.hp);
+        const hungry = hp < max;
+        const eatDist = Math.min(170, bh * 0.8 + 30);
+
+        let prey = null, best = BOSS_HUNT_RADIUS, preyX = 0, preyY = 0;
+        const eaten = [];
+        if (hungry) {
+            container.querySelectorAll('[data-fish]').forEach(f => {
+                if (f === boss || f.dataset.boss === '1') return;
+                const fr = f.getBoundingClientRect();
+                const fx = fr.left + fr.width / 2, fy = fr.top + fr.height / 2;
+                const d = Math.hypot(fx - cx, fy - cy);
+                if (d < best) { best = d; prey = f; preyX = fx; preyY = fy; }
+                if (d <= eatDist) eaten.push(f);
+            });
+        }
+
+        if (eaten.length) {
+            for (const f of eaten) {
+                if (hp >= max) break;
+                f.remove(); // consumed, not caught — the player misses out
+                hp = Math.min(max, hp + BOSS_HEAL_PER_FISH);
+            }
+            boss.dataset.hp = String(hp);
+            const fill = boss.querySelector('[data-hpfill]');
+            if (fill) fill.style.width = (hp / max) * 100 + '%';
+            boss.style.textShadow = '0 0 22px rgba(120,255,120,0.85)'; // heal glow
+            setTimeout(() => { if (boss.isConnected) boss.style.textShadow = '0 0 14px rgba(255,40,40,0.55)'; }, 160);
+        }
+
+        if (prey) {
+            const dx = preyX - cx, dy = preyY - cy;
+            const dist = Math.hypot(dx, dy) || 1;
+            const step = BOSS_HUNT_SPEED * dt;
+            x += (dx / dist) * step;
+            y += (dy / dist) * step;
+        } else {
+            x += BOSS_DRIFT_SPEED * dt;
+            if (x > window.innerWidth + 280) x = -280;
+            y += Math.sin(ts * 0.0008 + bobOff) * 14 * dt;
+        }
+        y = Math.max(-bh * 0.5, Math.min(window.innerHeight - bh * 0.5, y));
+
+        boss.style.transform = `translate(${x}px,${y}px)`;
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
 }
 
 function makeAnchor(startX) {
     return {
         x: startX,
         baseY: window.innerHeight * 0.1 + Math.random() * window.innerHeight * 0.75,
-        speed: Math.random() * 100 + 80,
+        speed: Math.random() * 200 + 180,
         waveAmp: Math.random() * 14 + 4,
         waveFreq: Math.random() * 0.4 + 0.3,
         waveOffset: Math.random() * Math.PI * 2,
@@ -568,10 +688,11 @@ function makeAnchor(startX) {
 
 function advanceAnchor(anchor, dt) {
     anchor.x += anchor.speed * dt;
-    if (anchor.x > window.innerWidth + 400) anchor.x = -400;
+    if (anchor.x > window.innerWidth + 300) anchor.x = -300;
 }
 
 function animateFish(el, anchorRef, offsetX, offsetY) {
+    (anchorRef.els || (anchorRef.els = [])).push(el);
     const jitterAmp = Math.random() * 8 + 4;
     const jitterFreq = Math.random() * 1.5 + 1.0;
     const jitterOffset = Math.random() * Math.PI * 2;
@@ -590,10 +711,30 @@ function animateFish(el, anchorRef, offsetX, offsetY) {
     requestAnimationFrame(frame);
 }
 
-function spawnListGroup(leaderStr, liPool, container, anchors) {
+// Once you've caught MAX_PER_TYPE of a particular fish (a tag in a given
+// colour), it stops spawning so the pond keeps offering variety.
+const MAX_PER_TYPE = 50;
+
+function isFishMaxed(fishStr) {
+    const c = caught[tagKey(fishStr)];
+    return !!c && (c.open + c.close) >= MAX_PER_TYPE;
+}
+
+// Random pick from a (weighted) pool that skips maxed-out fish; null if every
+// entry is maxed.
+function pickFish(pool) {
+    for (let i = 0; i < 20; i++) {
+        const f = pool[Math.floor(Math.random() * pool.length)];
+        if (!isFishMaxed(f)) return f;
+    }
+    const avail = pool.filter(f => !isFishMaxed(f));
+    return avail.length ? avail[Math.floor(Math.random() * avail.length)] : null;
+}
+
+function spawnListGroup(leaderStr, liPool, container, anchors, startX) {
     const isOrdered = getTag(leaderStr) === 'ol';
     const count = Math.floor(Math.random() * 4) + 2;
-    const anchor = makeAnchor(Math.random() * (window.innerWidth + 600) - 600);
+    const anchor = makeAnchor(startX);
     anchors.push(anchor);
 
     const leaderEl = makeFishEl(leaderStr, container);
@@ -602,7 +743,8 @@ function spawnListGroup(leaderStr, liPool, container, anchors) {
     const leaderW = displayStr(leaderStr).length * CHAR_W;
 
     for (let i = 0; i < count; i++) {
-        const liStr = liPool[Math.floor(Math.random() * liPool.length)];
+        const liStr = pickFish(liPool);
+        if (!liStr) continue;
         const liW = displayStr(liStr).length * CHAR_W;
         let offsetX, offsetY;
 
@@ -621,9 +763,64 @@ function spawnListGroup(leaderStr, liPool, container, anchors) {
     }
 }
 
+function spawnSchool(normalPool, container, anchors, startX) {
+    const fishStr = pickFish(normalPool);
+    if (!fishStr) return;
+    const display = displayStr(fishStr);
+    const fishW = (display.length + TAIL.length) * CHAR_W;
+    const schoolSize = Math.floor(Math.random() * 8) + 6;
+    const blobW = fishW * 2.5 + 40;
+    const blobH = CHAR_H * 3 + 20;
+    const anchor = makeAnchor(startX);
+    anchors.push(anchor);
+
+    for (let i = 0; i < schoolSize; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random());
+        const offsetX = -Math.abs(Math.cos(angle) * r * blobW);
+        const offsetY = Math.sin(angle) * r * blobH;
+        const f = Math.random() < 0.12 ? oppositeForm(fishStr) : fishStr;
+        const el = makeFishEl(f, container);
+        animateFish(el, anchor, offsetX, offsetY);
+    }
+}
+
+function spawnSolo(normalPool, container, anchors, startX) {
+    const fishStr = pickFish(normalPool);
+    if (!fishStr) return;
+    const anchor = makeAnchor(startX);
+    anchors.push(anchor);
+    const el = makeFishEl(fishStr, container);
+    animateFish(el, anchor, 0, 0);
+}
+
+// The net's effect on a boss follows the reciprocal series (1, 1/2, 1/3, …),
+// so it matters less every boss. Bosses get incrementally larger, and their HP
+// is proportional to the length of their tag string.
+let bossesSpawned = 0;
+const BOSS_FONT_BASE = 54;
+const BOSS_FONT_STEP = 10;
+const BOSS_FONT_MAX = 140;
+const BOSS_HP_PER_CHAR = 2; // hp per character of the tag string
+
+function spawnBoss(pool, container, anchors, startX) {
+    const n = ++bossesSpawned;
+    let fishStr = pickFish(pool) || pool[Math.floor(Math.random() * pool.length)];
+    if (isGolden(fishStr)) fishStr = displayStr(fishStr); // bosses render red, not gold
+    const hp = Math.max(1, Math.round(displayStr(fishStr).length * BOSS_HP_PER_CHAR)); // longer tag = tankier
+    const fontSize = Math.min(BOSS_FONT_BASE + (n - 1) * BOSS_FONT_STEP, BOSS_FONT_MAX);
+    const netDmg = 1 / n; // reciprocal series
+    const el = makeBossEl(fishStr, container, hp, fontSize, netDmg);
+    runBoss(el, container, startX);
+}
+
+// Spawn x positions: scattered across the screen (initial fill) vs. off-screen
+// left so wave fish swim in (they all drift rightward and wrap around).
+function scatterX() { return Math.random() * (window.innerWidth + 600) - 600; }
+function offscreenX() { return -(Math.random() * 400 + 200); }
+
 export function spawnSchools(fishPool, container, schoolCount = 6, soloCount = 5, listGroupCount = 4) {
     createInventory();
-    loadSecrets();
 
     const uniqueKeys = new Set(fishPool.map(f => {
         const tag = getTag(f);
@@ -634,18 +831,6 @@ export function spawnSchools(fishPool, container, schoolCount = 6, soloCount = 5
         return !['ol', 'ul', 'li'].includes(tag);
     });
 
-    function completeSecrets() {
-        for (const [tag, items] of Object.entries(secrets)) {
-            const found = new Set(discoveredSecrets.filter(s => s.tag === tag).map(s => s.value));
-            for (const item of items) {
-                if (!found.has(item.value)) discoveredSecrets.push({ tag, type: item.type, value: item.value });
-            }
-        }
-        localStorage.setItem('discoveredSecrets', JSON.stringify(discoveredSecrets));
-        checkSecretsMilestone();
-        renderSecrets();
-    }
-
     let lastTime = null;
     const anchors = [];
 
@@ -653,39 +838,18 @@ export function spawnSchools(fishPool, container, schoolCount = 6, soloCount = 5
     const listLeaders = fishPool.filter(f => getTag(f) === 'ol' || getTag(f) === 'ul');
     const normalPool = fishPool.filter(f => getTag(f) !== 'li' && getTag(f) !== 'ol' && getTag(f) !== 'ul');
 
-    for (let s = 0; s < schoolCount; s++) {
-        const fishStr = normalPool[Math.floor(Math.random() * normalPool.length)];
-        const display = displayStr(fishStr);
-        const fishW = (display.length + TAIL.length) * CHAR_W;
-        const schoolSize = Math.floor(Math.random() * 8) + 6;
-        const blobW = fishW * 2.5 + 40;
-        const blobH = CHAR_H * 3 + 20;
-        const anchor = makeAnchor(Math.random() * (window.innerWidth + 600) - 600);
-        anchors.push(anchor);
+    const hasLists = listLeaders.length && liPool.length;
 
-        for (let i = 0; i < schoolSize; i++) {
-            const angle = Math.random() * Math.PI * 2;
-            const r = Math.sqrt(Math.random());
-            const offsetX = -Math.abs(Math.cos(angle) * r * blobW);
-            const offsetY = Math.sin(angle) * r * blobH;
-            const f = Math.random() < 0.12 ? oppositeForm(fishStr) : fishStr;
-            const el = makeFishEl(f, container);
-            animateFish(el, anchor, offsetX, offsetY);
-        }
-    }
+    // bosses are drawn only from tags flagged ":boss" (fall back to any if none)
+    const bossCandidates = normalPool.filter(f => bossTags.has(getTag(f)));
+    const bossPool = bossCandidates.length ? bossCandidates : normalPool;
 
-    for (let s = 0; s < soloCount; s++) {
-        const fishStr = normalPool[Math.floor(Math.random() * normalPool.length)];
-        const anchor = makeAnchor(Math.random() * (window.innerWidth + 600) - 600);
-        anchors.push(anchor);
-        const el = makeFishEl(fishStr, container);
-        animateFish(el, anchor, 0, 0);
-    }
-
-    if (listLeaders.length && liPool.length) {
+    for (let s = 0; s < schoolCount; s++) spawnSchool(normalPool, container, anchors, scatterX());
+    for (let s = 0; s < soloCount; s++) spawnSolo(normalPool, container, anchors, scatterX());
+    if (hasLists) {
         for (let s = 0; s < listGroupCount; s++) {
-            const leaderStr = listLeaders[Math.floor(Math.random() * listLeaders.length)];
-            spawnListGroup(leaderStr, liPool, container, anchors);
+            const leaderStr = pickFish(listLeaders);
+            if (leaderStr) spawnListGroup(leaderStr, liPool, container, anchors, scatterX());
         }
     }
 
@@ -698,27 +862,100 @@ export function spawnSchools(fishPool, container, schoolCount = 6, soloCount = 5
     }
     requestAnimationFrame(tick);
 
+    // Keep the pond replenished so fishing never requires a page refresh: every
+    // couple seconds, top the population back up with fresh fish entering
+    // off-screen.
+    const TARGET_FISH = 80;
+
+    // Boss escalation is tied to how many fish you catch: every FISH_PER_WAVE
+    // caught counts as one "wave" and raises the boss chance by BOSS_CHANCE_STEP.
+    // When a boss finally appears the odds reset to zero. Larger FISH_PER_WAVE
+    // and/or smaller step => rarer bosses.
+    const FISH_PER_WAVE = 100;
+    const BOSS_CHANCE_STEP = 0.3;
+    let bossChance = 0;
+    let lastWaveCount = totalCaught();
+
+    function liveFishCount() {
+        return container.querySelectorAll('[data-fish]').length;
+    }
+    function spawnWave() {
+        // drop anchors whose fish have all been caught (keeps tick() bounded)
+        for (let i = anchors.length - 1; i >= 0; i--) {
+            const a = anchors[i];
+            if (a.els && !a.els.some(el => el.isConnected)) anchors.splice(i, 1);
+        }
+        // top the population back up from off-screen
+        let guard = 0;
+        while (liveFishCount() < TARGET_FISH && guard++ < 12) {
+            const roll = Math.random();
+            if (roll < 0.65) {
+                spawnSchool(normalPool, container, anchors, offscreenX());
+            } else if (roll < 0.9 || !hasLists) {
+                spawnSolo(normalPool, container, anchors, offscreenX());
+            } else {
+                const leaderStr = pickFish(listLeaders);
+                if (leaderStr) spawnListGroup(leaderStr, liPool, container, anchors, offscreenX());
+            }
+        }
+        // each completed wave of caught fish escalates (and may trigger) a boss
+        while (totalCaught() - lastWaveCount >= FISH_PER_WAVE) {
+            lastWaveCount += FISH_PER_WAVE;
+            if (Math.random() < bossChance) {
+                spawnBoss(bossPool, container, anchors, offscreenX());
+                showBossBanner();
+                bossChance = 0;
+            } else {
+                bossChance += BOSS_CHANCE_STEP;
+            }
+        }
+    }
+    setInterval(spawnWave, 2000);
+
     const sel = document.createElement('div');
     sel.style.cssText = 'position:fixed;border:1px solid rgba(255,255,255,0.4);background:rgba(255,255,255,0.05);pointer-events:none;display:none;z-index:5;';
     document.body.appendChild(sel);
 
+    // net cooldown: after each cast the net must recharge before it can be cast
+    // again. A small bar at the bottom fills back up as it recharges.
+    const cdBar = document.createElement('div');
+    cdBar.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);width:160px;height:6px;background:rgba(255,255,255,0.1);border:1px solid #1a2a1a;z-index:6;display:none;pointer-events:none;';
+    const cdFill = document.createElement('div');
+    cdFill.style.cssText = 'height:100%;width:0%;background:#5a9a5a;';
+    cdBar.appendChild(cdFill);
+    document.body.appendChild(cdBar);
+
+    let netReadyAt = 0;
+    const netReady = () => Date.now() >= netReadyAt;
+    function startNetCooldown(duration) {
+        netReadyAt = Date.now() + duration;
+        cdBar.style.display = 'block';
+        (function tickCd() {
+            const remaining = netReadyAt - Date.now();
+            if (remaining <= 0) { cdBar.style.display = 'none'; return; }
+            cdFill.style.width = (1 - remaining / duration) * 100 + '%';
+            requestAnimationFrame(tickCd);
+        })();
+    }
+
     let dragStart = null;
 
     document.addEventListener('mousedown', e => {
-        if (totalCaught() < 50) return;
+        if (totalCaught() < NET_UNLOCK) return;
         if (e.target.closest('[data-fish]') || e.target.closest('#inventory-panel')) return;
+        if (!netReady()) return; // still recharging
         dragStart = { x: e.clientX, y: e.clientY };
     });
 
     document.addEventListener('mousemove', e => {
         if (!dragStart) return;
-        const dx = e.clientX - dragStart.x, dy = e.clientY - dragStart.y;
-        if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+        if (Math.abs(e.clientX - dragStart.x) < 4 && Math.abs(e.clientY - dragStart.y) < 4) return;
+        const r = netRect(dragStart, e.clientX, e.clientY);
         sel.style.display = 'block';
-        sel.style.left = Math.min(e.clientX, dragStart.x) + 'px';
-        sel.style.top = Math.min(e.clientY, dragStart.y) + 'px';
-        sel.style.width = Math.abs(dx) + 'px';
-        sel.style.height = Math.abs(dy) + 'px';
+        sel.style.left = r.left + 'px';
+        sel.style.top = r.top + 'px';
+        sel.style.width = r.width + 'px';
+        sel.style.height = r.height + 'px';
     });
 
     document.addEventListener('mouseup', e => {
@@ -726,14 +963,16 @@ export function spawnSchools(fishPool, container, schoolCount = 6, soloCount = 5
         const start = dragStart;
         dragStart = null;
         sel.style.display = 'none';
-        const x1 = Math.min(e.clientX, start.x), x2 = Math.max(e.clientX, start.x);
-        const y1 = Math.min(e.clientY, start.y), y2 = Math.max(e.clientY, start.y);
-        if (x2 - x1 < 4 || y2 - y1 < 4) return;
+        const r = netRect(start, e.clientX, e.clientY);
+        if (r.width < 4 || r.height < 4) return;
+        const x1 = r.left, x2 = r.left + r.width;
+        const y1 = r.top, y2 = r.top + r.height;
         document.querySelectorAll('[data-fish]').forEach(fish => {
             const fr = fish.getBoundingClientRect();
             if (fr.left < x2 && fr.right > x1 && fr.top < y2 && fr.bottom > y1) {
-                catchFish(fish.dataset.fish, fish);
+                hitFish(fish.dataset.fish, fish, true);
             }
         });
+        startNetCooldown(netCooldownFor(r.width, r.height));
     });
 }
